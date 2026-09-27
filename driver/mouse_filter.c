@@ -4,6 +4,21 @@
 // injected-бит не выставляется, ввод неотличим от физической мыши.
 #include "driver.h"
 
+// ObReferenceObjectByName и IoDriverObjectType не экспортируются через ntddk.h,
+// но присутствуют в ntoskrnl.exe — объявляем extern явно.
+// ntifs.h содержит их, но недоступен в WDK NuGet km-only конфигурации.
+NTKERNELAPI NTSTATUS ObReferenceObjectByName(
+    PUNICODE_STRING ObjectName,
+    ULONG           Attributes,
+    PACCESS_STATE   AccessState,
+    ACCESS_MASK     DesiredAccess,
+    POBJECT_TYPE    ObjectType,
+    KPROCESSOR_MODE AccessMode,
+    PVOID           ParseContext,
+    PVOID*          Object
+);
+extern POBJECT_TYPE* IoDriverObjectType;
+
 // ─── Структуры mouclass ───────────────────────────────────────────────────
 typedef VOID(*PMOUSE_SERVICE_CALLBACK)(
     PDEVICE_OBJECT DevObj,
@@ -22,9 +37,6 @@ typedef struct _MOUSE_FILTER_CTX {
 static MOUSE_FILTER_CTX g_filter = { 0 };
 
 // ─── Наш ServiceCallback (вызывается вместо оригинального) ───────────────
-// Здесь мы можем:
-//   1. Пропустить входящие данные (оригинальный поток мыши)
-//   2. Вставить дополнительные MOUSE_INPUT_DATA для компенсации
 VOID RcMouseServiceCallback(
     PDEVICE_OBJECT DevObj,
     PMOUSE_INPUT_DATA InputDataStart,
@@ -47,17 +59,14 @@ VOID RcMouseServiceCallback(
     while (tail != head) {
         RC_OFFSET_MSG* msg = &ctx->queue.buf[tail];
 
-        // Создаём синтетический MOUSE_INPUT_DATA
         MOUSE_INPUT_DATA synthetic = { 0 };
-        synthetic.UnitId    = 0;        // тот же юнит что и реальная мышь
+        synthetic.UnitId    = 0;
         synthetic.Flags     = MOUSE_MOVE_RELATIVE;
         synthetic.LastX     = (LONG)msg->x;
         synthetic.LastY     = (LONG)msg->y;
 
         ULONG consumed = 0;
 
-        // Инжектируем через оригинальный callback как ещё один пакет ввода.
-        // С точки зрения системы это физическое движение мышью.
         if (g_filter.OriginalCallback) {
             g_filter.OriginalCallback(
                 DevObj,
@@ -74,22 +83,17 @@ VOID RcMouseServiceCallback(
 }
 
 // ─── Установка фильтра через IOCTL_INTERNAL_MOUSE_CONNECT ────────────────
-// Вызывается при DeviceAdd фильтрующего устройства.
-// Мы перехватываем CONNECT_DATA чтобы подменить ServiceCallback.
+// CONNECT_DATA берём из kbdmou.h (включён через driver.h → kbdmou.h).
+// Локальный typedef убран — он дублировал системный и вызывал C4459.
 NTSTATUS RcInstallMouseFilter(
     PDEVICE_OBJECT FilterDO,
     PDEVICE_OBJECT LowerDO,
     RC_DEV_CTX*    RcCtx)
 {
-    // CONNECT_DATA описывает обратный вызов mouclass
-    typedef struct _CONNECT_DATA {
-        PDEVICE_OBJECT ClassDeviceObject;
-        PVOID          ClassService;
-    } CONNECT_DATA, *PCONNECT_DATA;
-
     CONNECT_DATA connect;
     connect.ClassDeviceObject = FilterDO;
-    connect.ClassService      = RcMouseServiceCallback;
+    // C4152: VOID* ← указатель на функцию — явный каст через PVOID
+    connect.ClassService      = (PVOID)(ULONG_PTR)RcMouseServiceCallback;
 
     KEVENT           evt;
     IO_STATUS_BLOCK  iosb;
@@ -111,11 +115,9 @@ NTSTATUS RcInstallMouseFilter(
     st = iosb.Status;
 
     if (NT_SUCCESS(st)) {
-        // Mouclass вернул оригинальный ClassService через connect.ClassService
         g_filter.OriginalCallback = (PMOUSE_SERVICE_CALLBACK)connect.ClassService;
         g_filter.ClassDevObj      = connect.ClassDeviceObject;
         g_filter.RcCtx            = RcCtx;
-        // ctx->lower_mouse нужен для future IRP forwarding
         RcCtx->lower_mouse = LowerDO;
     }
 
@@ -123,7 +125,6 @@ NTSTATUS RcInstallMouseFilter(
 }
 
 // ─── Получить нижнее устройство mouclass ──────────────────────────────────
-// Проходим по стеку драйверов от \Driver\mouclass PDO
 PDEVICE_OBJECT RcFindMouclassDevice(VOID) {
     UNICODE_STRING name = RTL_CONSTANT_STRING(L"\\Driver\\mouclass");
     PDRIVER_OBJECT drv  = NULL;

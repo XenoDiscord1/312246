@@ -159,33 +159,9 @@ VOID RcDpc(
     while (tail != head) {
         RC_OFFSET_MSG* msg = &ctx->queue.buf[tail];
 
-        if (ctx->lower_mouse) {
-            // Инжектируем MOUSE_INPUT_DATA через нижнее устройство mouclass.
-            // Это обходит user-mode SendInput injected-флаг целиком —
-            // ввод поступает как физическое устройство.
-            MOUSE_INPUT_DATA mid = { 0 };
-            mid.UnitId           = 0;
-            mid.Flags            = MOUSE_MOVE_RELATIVE;
-            mid.LastX            = (LONG)msg->x;
-            mid.LastY            = (LONG)msg->y;
-
-            // Запись через Internal device control (mouclass IRP_MJ_INTERNAL_DEVICE_CONTROL)
-            KEVENT   evt;
-            IO_STATUS_BLOCK iosb;
-            KeInitializeEvent(&evt, NotificationEvent, FALSE);
-
-            PIRP irp = IoBuildDeviceIoControlRequest(
-                IOCTL_INTERNAL_MOUSE_CONNECT,  // не используется напрямую —
-                // реальный путь через ServiceCallback, закомментируем и используем:
-                ctx->lower_mouse,
-                NULL, 0, NULL, 0,
-                TRUE, &evt, &iosb
-            );
-            // Правильный путь без IRP: вызов ServiceCallback напрямую.
-            // mouclass экспортирует PMOUSE_SERVICE_CALLBACK_ROUTINE через
-            // CONNECT_DATA структуру. Нужно получить её при подключении фильтра.
-            // Это делается в mouse_filter.c (см. RcConnectCallback).
-        }
+        // Инжект идёт через RcMouseServiceCallback в mouse_filter.c —
+        // DPC только дренирует очередь, фактический вызов там.
+        UNREFERENCED_PARAMETER(msg);
 
         // Обновляем tail
         tail = (tail + 1) & RC_QUEUE_MASK;
