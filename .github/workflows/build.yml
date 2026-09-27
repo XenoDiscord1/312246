@@ -1,0 +1,170 @@
+name: Build RecoilComp
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── USERMODE — работает ──────────────────────────────────────────────────
+  build-usermode:
+    name: Usermode (CMake)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        working-directory: usermode
+        run: cmake -B build
+
+      - name: Build
+        working-directory: usermode
+        run: cmake --build build --config Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RecoilComp-usermode
+          path: usermode/build/Release/RecoilComp.exe
+
+  # ── DRIVER ──────────────────────────────────────────────────────────────────
+  build-driver:
+    name: Kernel Driver (WDK NuGet)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install WDK NuGet packages
+        run: |
+          nuget install Microsoft.Windows.WDK.x64     -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP      -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP.x64 -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+
+      - name: Build kernel driver
+        shell: pwsh
+        run: |
+          # ── km headers: ntddk.h → папка km ──────────────────────────────
+          $ntddkFile = Get-ChildItem "C:\wdk" -Recurse -Filter "ntddk.h" -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+          if (-not $ntddkFile) { Write-Error "ntddk.h not found"; exit 1 }
+          $kmInc = $ntddkFile.Directory.FullName
+
+          # ── WDF/KMDF headers: wdf.h — в Wdf\KMDF\x.xx\ внутри пакета ──
+          $wdfFile = Get-ChildItem "C:\wdk" -Recurse -Filter "wdf.h" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-not $wdfFile) {
+            Write-Host "wdf.h not found. Package tree (depth 5):"
+            Get-ChildItem "C:\wdk" -Recurse -Depth 5 | Select-Object FullName | Format-Table -AutoSize
+            Write-Error "wdf.h not found — KMDF headers missing from NuGet package"
+            exit 1
+          }
+          $wdfInc = $wdfFile.Directory.FullName
+
+          # ── shared / um headers ──────────────────────────────────────────
+          $basetsd  = Get-ChildItem "C:\wdk" -Recurse -Filter "basetsd.h" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          $windowsh = Get-ChildItem "C:\wdk" -Recurse -Filter "windows.h" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          $shInc = if ($basetsd)  { $basetsd.Directory.FullName }  else { $null }
+          $umInc = if ($windowsh) { $windowsh.Directory.FullName } else { $null }
+
+          # ── km lib: ntoskrnl.lib → папка lib ────────────────────────────
+          $ntoskrnlLib = Get-ChildItem "C:\wdk" -Recurse -Filter "ntoskrnl.lib" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -match "\\x64" } |
+                         Select-Object -First 1
+          if (-not $ntoskrnlLib) { Write-Error "ntoskrnl.lib not found"; exit 1 }
+          $kmLib = $ntoskrnlLib.Directory.FullName
+
+          # ── KMDF stub lib: WdfDriverStub.lib ────────────────────────────
+          $wdfStub = Get-ChildItem "C:\wdk" -Recurse -Filter "WdfDriverStub.lib" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "\\x64" } |
+                     Select-Object -First 1
+          $kmdfLib = if ($wdfStub) { $wdfStub.Directory.FullName } else { $null }
+
+          Write-Host "[*] kmInc  = $kmInc"
+          Write-Host "[*] wdfInc = $wdfInc"
+          Write-Host "[*] shInc  = $shInc"
+          Write-Host "[*] umInc  = $umInc"
+          Write-Host "[*] kmLib  = $kmLib"
+          Write-Host "[*] kmdfLib= $kmdfLib"
+
+          New-Item -ItemType Directory -Force -Path driver\obj | Out-Null
+
+          # ── Include flags ─────────────────────────────────────────────────
+          # /D_KERNEL_MODE убран — /kernel сам его определяет (C4117 reserved macro)
+          $iFlags = @("/I$kmInc", "/I$wdfInc")
+          if ($shInc) { $iFlags += "/I$shInc" }
+          if ($umInc) { $iFlags += "/I$umInc" }
+          $iFlags += "/Iusermode"
+
+          # KMDF version — нужны для wdf.h чтобы выбрать правильный API-уровень
+          # 1.33 соответствует Windows 10 2004 / WDK 10.0.19041+
+          $kmdfDefs = @("/DKMDF_VERSION_MAJOR=1", "/DKMDF_VERSION_MINOR=33")
+
+          # ── Compile ───────────────────────────────────────────────────────
+          $sources = @("driver\driver.c", "driver\evasion.c", "driver\mouse_filter.c")
+          foreach ($src in $sources) {
+            $obj = "driver\obj\" + [IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
+            Write-Host "CC  $src"
+
+            $clArgs = @("/nologo", "/c") +
+                      $iFlags +
+                      $kmdfDefs +
+                      @(
+                        "/kernel", "/GS-", "/Gz", "/GF", "/Gm-", "/EHs-c-", "/TC", "/MT",
+                        "/W4", "/WX-", "/O2", "/Oi",
+                        "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
+                        "/Fo$obj",
+                        $src
+                      )
+
+            & cl.exe @clArgs
+            if ($LASTEXITCODE -ne 0) { Write-Error "Compile failed: $src"; exit 1 }
+          }
+
+          # ── Link ──────────────────────────────────────────────────────────
+          $objs = Get-ChildItem driver\obj\*.obj | ForEach-Object { $_.FullName }
+          Write-Host "LINK -> driver\recoil.sys"
+
+          $linkArgs = @(
+            "/nologo",
+            "/SUBSYSTEM:NATIVE", "/DRIVER:WDM",
+            "/NODEFAULTLIB", "/ENTRY:DriverEntry",
+            "/LIBPATH:$kmLib"
+          )
+          if ($kmdfLib) { $linkArgs += "/LIBPATH:$kmdfLib" }
+          $linkArgs += @(
+            "ntoskrnl.lib", "hal.lib", "wdm.lib", "wdmsec.lib", "wmilib.lib",
+            "BufferOverflowFastFailK.lib"
+          )
+          if ($wdfStub) { $linkArgs += "WdfDriverStub.lib" }
+          $linkArgs += @("/OUT:driver\recoil.sys", "/MAP:driver\recoil.map") + $objs
+
+          & link.exe @linkArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "Link failed"; exit 1 }
+
+          $sz = (Get-Item driver\recoil.sys).Length
+          Write-Host "[OK] recoil.sys — $sz bytes"
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RecoilDriver-sys
+          path: |
+            driver/recoil.sys
+            driver/install.bat
+            driver/recoil.map
